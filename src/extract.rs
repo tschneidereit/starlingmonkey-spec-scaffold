@@ -29,6 +29,32 @@ pub enum AlgorithmKind {
     Standalone { name: String },
 }
 
+/// A single algorithm step with its hierarchical label.
+///
+/// Labels mirror the spec's step structure:
+/// - top-level steps: "1", "2", ...
+/// - nested substeps (e.g. inside a loop): "5.1", "5.5.2", ...
+/// - switch branches: "10 `Blob`" (the branch condition after the step number)
+/// - substeps of a switch branch: "10 `Blob`.1"
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Step {
+    /// The hierarchical step label, e.g. "5.1" or "10 `Blob`".
+    pub label: String,
+    /// The step text, with inline markup annotations. Unordered sub-lists
+    /// are rendered as "- "-prefixed lines separated by newlines.
+    pub text: String,
+}
+
+impl Step {
+    /// Create a step with a plain top-level number label.
+    pub fn numbered(n: usize, text: impl Into<String>) -> Self {
+        Step {
+            label: n.to_string(),
+            text: text.into(),
+        }
+    }
+}
+
 /// An algorithm extracted from spec prose, associated with a method or concept.
 #[derive(Debug, Clone)]
 pub struct AlgorithmSteps {
@@ -39,7 +65,7 @@ pub struct AlgorithmSteps {
     /// The numbered steps in the algorithm. For one-liner descriptions
     /// (e.g., "The origin getter steps are to return..."), this contains
     /// a single entry with the description text.
-    pub steps: Vec<String>,
+    pub steps: Vec<Step>,
     /// The interface this algorithm belongs to, from `data-algorithm-for`
     /// or section context. Empty when not available.
     pub interface: String,
@@ -138,7 +164,7 @@ pub fn extract_algorithms(html: &str) -> Vec<AlgorithmSteps> {
                 results.push(AlgorithmSteps {
                     heading: text.clone(),
                     kind,
-                    steps: vec![description.clone()],
+                    steps: vec![Step::numbered(1, description.clone())],
                     interface: interface.clone(),
                     fragment: fragment.clone(),
                 });
@@ -253,9 +279,11 @@ pub fn extract_algorithms(html: &str) -> Vec<AlgorithmSteps> {
             continue;
         }
 
-        // Find the first <ol> child of the div
-        let ol_selector = Selector::parse("ol").expect("valid CSS selector");
-        let has_ol = element.select(&ol_selector).next();
+        // Find the first <ol> that is a direct child of the div. Descendant
+        // <ol>s must not count: they may belong to a switch arm (URL's
+        // "origin") or to a nested algorithm div (Streams' "read all bytes"),
+        // and treating them as this algorithm's steps would steal them.
+        let has_ol = direct_child_elements(&element, "ol").next();
 
         if let Some(ol) = has_ol {
             let steps = extract_ol_steps(&ol);
@@ -270,8 +298,31 @@ pub fn extract_algorithms(html: &str) -> Vec<AlgorithmSteps> {
                     });
                 }
             }
+        } else if element
+            .children()
+            .filter_map(ElementRef::wrap)
+            .any(|c| is_step_block(&c))
+        {
+            // No <ol> child, but the algorithm body is a top-level <ul>
+            // condition list or <dl class="switch"> — extract it as a single
+            // step (with bullet lines / branch substeps) rather than
+            // flattening everything into the heading.
+            let mut steps = Vec::new();
+            collect_step_body(&element, "1", &mut steps);
+            if !steps.is_empty() {
+                for kind in kinds {
+                    results.push(AlgorithmSteps {
+                        heading: text.clone(),
+                        kind,
+                        steps: steps.clone(),
+                        interface: interface.clone(),
+                        fragment: fragment.clone(),
+                    });
+                }
+            }
         } else {
-            // No <ol> child — treat the entire heading as a one-liner description.
+            // No step-bearing block at all — treat the entire heading as a
+            // one-liner description.
             let is_one_liner = is_one_liner_algorithm(&text);
             let description = if is_one_liner {
                 extract_one_liner_description(&text)
@@ -285,7 +336,7 @@ pub fn extract_algorithms(html: &str) -> Vec<AlgorithmSteps> {
                     results.push(AlgorithmSteps {
                         heading: text.clone(),
                         kind,
-                        steps: vec![description.clone()],
+                        steps: vec![Step::numbered(1, description.clone())],
                         interface: interface.clone(),
                         fragment: fragment.clone(),
                     });
@@ -299,13 +350,14 @@ pub fn extract_algorithms(html: &str) -> Vec<AlgorithmSteps> {
 
 /// Extract the heading text from a `<div class="algorithm">` element.
 ///
-/// Collects all text content from nodes before the first `<ol>` child,
+/// Collects all text content from nodes before the first step-bearing block
+/// child (`<ol>`, `<ul>`, or `<dl class="switch">`) or nested algorithm div,
 /// which is the algorithm heading (e.g., "The cancel(reason) method steps are:").
 fn extract_div_algorithm_heading(div: &ElementRef) -> String {
     let mut heading = String::new();
     for child in div.children() {
         if let Some(child_el) = ElementRef::wrap(child) {
-            if child_el.value().name() == "ol" {
+            if is_step_block(&child_el) || is_algorithm_div(&child_el) {
                 break;
             }
             // Recurse into inline elements (dfn, code, etc.) to get their text
@@ -317,12 +369,141 @@ fn extract_div_algorithm_heading(div: &ElementRef) -> String {
     heading
 }
 
-/// Extract step text from a top-level `<ol>` element's direct `<li>` children.
-fn extract_ol_steps(ol: &ElementRef) -> Vec<String> {
-    direct_child_elements(ol, "li")
-        .map(|li| normalize_whitespace(&extract_formatted_text(&li)))
-        .filter(|s| !s.is_empty())
-        .collect()
+/// Check whether an element is itself an algorithm div (a nested algorithm
+/// definition, processed separately).
+fn is_algorithm_div(el: &ElementRef) -> bool {
+    el.value().name() == "div"
+        && (el.value().attr("data-algorithm").is_some()
+            || el.value().classes().any(|c| c == "algorithm"))
+}
+
+/// Check whether an element is a block that holds algorithm steps: a numbered
+/// list, a bulleted condition list, or a switch.
+fn is_step_block(el: &ElementRef) -> bool {
+    match el.value().name() {
+        "ol" | "ul" => true,
+        "dl" => el.value().classes().any(|c| c == "switch"),
+        _ => false,
+    }
+}
+
+/// Extract steps from a top-level `<ol>` element, recursing into nested
+/// structures so each spec step becomes its own labeled entry:
+///
+/// - nested `<ol>` substeps get dotted labels ("5.1", "5.5.2", ...)
+/// - `<dl class="switch">` branches get the branch condition appended to the
+///   parent step's label ("10 `Blob`"), with substeps as "10 `Blob`.1"
+/// - `<ul>` sub-lists stay part of their step's text as "- "-prefixed lines
+fn extract_ol_steps(ol: &ElementRef) -> Vec<Step> {
+    let mut steps = Vec::new();
+    collect_ol_steps(ol, "", &mut steps);
+    steps
+}
+
+/// Collect steps from an `<ol>`'s direct `<li>` children, labeling each with
+/// `prefix.N` (or just `N` at the top level).
+fn collect_ol_steps(ol: &ElementRef, prefix: &str, out: &mut Vec<Step>) {
+    for (i, li) in direct_child_elements(ol, "li").enumerate() {
+        let label = if prefix.is_empty() {
+            (i + 1).to_string()
+        } else {
+            format!("{prefix}.{}", i + 1)
+        };
+        collect_step_body(&li, &label, out);
+    }
+}
+
+/// Collect the step for one `<li>` (or switch-branch `<dd>`) body, then recurse
+/// into any nested step structures it contains.
+///
+/// Inline content (paragraphs, text, `<ul>` sub-lists) becomes this step's
+/// text; nested `<ol>` lists and `<dl class="switch">` branches become
+/// separate steps with derived labels. If the body has no inline text of its
+/// own (e.g. a switch branch that consists solely of substeps), no step is
+/// emitted for it — the nested steps' labels carry the context.
+fn collect_step_body(body: &ElementRef, label: &str, out: &mut Vec<Step>) {
+    enum NestedBlock<'a> {
+        Substeps(ElementRef<'a>),
+        Switch(ElementRef<'a>),
+    }
+
+    let mut lines: Vec<String> = Vec::new();
+    let mut inline = String::new();
+    let mut nested = Vec::new();
+
+    let flush_inline = |inline: &mut String, lines: &mut Vec<String>| {
+        let text = normalize_whitespace(inline);
+        if !text.is_empty() {
+            lines.push(text);
+        }
+        inline.clear();
+    };
+
+    for child in body.children() {
+        if let Some(el) = ElementRef::wrap(child) {
+            match el.value().name() {
+                "ol" => nested.push(NestedBlock::Substeps(el)),
+                "dl" if el.value().classes().any(|c| c == "switch") => {
+                    nested.push(NestedBlock::Switch(el));
+                }
+                "ul" => {
+                    flush_inline(&mut inline, &mut lines);
+                    for item in direct_child_elements(&el, "li") {
+                        let text = normalize_whitespace(&extract_formatted_text(&item));
+                        if !text.is_empty() {
+                            lines.push(format!("- {text}"));
+                        }
+                    }
+                }
+                _ => inline.push_str(&extract_formatted_text(&el)),
+            }
+        } else if let Node::Text(t) = child.value() {
+            inline.push_str(t);
+        }
+    }
+    flush_inline(&mut inline, &mut lines);
+
+    if !lines.is_empty() {
+        out.push(Step {
+            label: label.to_string(),
+            text: lines.join("\n"),
+        });
+    }
+
+    for block in nested {
+        match block {
+            NestedBlock::Substeps(ol) => collect_ol_steps(&ol, label, out),
+            NestedBlock::Switch(dl) => collect_switch_steps(&dl, label, out),
+        }
+    }
+}
+
+/// Collect steps from a `<dl class="switch">`'s branches.
+///
+/// Each `<dt>` holds a branch condition; consecutive `<dt>`s share the
+/// following `<dd>`. The branch label is the parent step's label followed by
+/// the condition(s), e.g. "10 `Blob`" or "4 `day`, `week`".
+fn collect_switch_steps(dl: &ElementRef, parent_label: &str, out: &mut Vec<Step>) {
+    let mut conditions: Vec<String> = Vec::new();
+    for child in dl.children().filter_map(ElementRef::wrap) {
+        match child.value().name() {
+            "dt" => {
+                // Spec markup nests <code><a>…</a></code>, which would yield
+                // doubled backticks (``Blob``) — collapse them to one pair.
+                let text =
+                    normalize_whitespace(&extract_formatted_text(&child)).replace("``", "`");
+                if !text.is_empty() {
+                    conditions.push(text);
+                }
+            }
+            "dd" => {
+                let label = format!("{parent_label} {}", conditions.join(", "));
+                collect_step_body(&child, &label, out);
+                conditions.clear();
+            }
+            _ => {}
+        }
+    }
 }
 
 /// Classify an algorithm from the `data-algorithm` attribute on a `<div>`.
@@ -1420,7 +1601,7 @@ interface WorkerLocation {
         assert_eq!(algos.len(), 1);
         assert!(algos[0].heading.contains("append"));
         assert_eq!(algos[0].steps.len(), 3);
-        assert!(algos[0].steps[0].contains("Validate"));
+        assert!(algos[0].steps[0].text.contains("Validate"));
         assert!(
             matches!(&algos[0].kind, AlgorithmKind::Method { name, is_static: false } if name == "append")
         );
@@ -1535,7 +1716,7 @@ interface WorkerLocation {
         assert_eq!(algos.len(), 1);
         assert!(matches!(&algos[0].kind, AlgorithmKind::Getter { name } if name == "origin"));
         assert_eq!(algos[0].steps.len(), 1);
-        assert!(algos[0].steps[0].starts_with("Return"));
+        assert!(algos[0].steps[0].text.starts_with("Return"));
     }
 
     #[test]
@@ -1685,7 +1866,7 @@ interface WorkerLocation {
             AlgorithmKind::Method { name, is_static: false } if name == "cancel"
         ));
         assert_eq!(algos[0].steps.len(), 2);
-        assert!(algos[0].steps[0].contains("IsReadableStreamLocked"));
+        assert!(algos[0].steps[0].text.contains("IsReadableStreamLocked"));
     }
 
     #[test]
@@ -1769,7 +1950,7 @@ interface WorkerLocation {
         assert_eq!(algos.len(), 1);
         assert!(matches!(&algos[0].kind, AlgorithmKind::Getter { name } if name == "readable"));
         assert_eq!(algos[0].steps.len(), 1);
-        assert!(algos[0].steps[0].contains("Return"));
+        assert!(algos[0].steps[0].text.contains("Return"));
     }
 
     #[test]
@@ -1796,8 +1977,8 @@ interface WorkerLocation {
         assert_eq!(algos.len(), 2);
         assert!(matches!(&algos[0].kind, AlgorithmKind::Getter { name } if name == "locked"));
         assert!(matches!(&algos[1].kind, AlgorithmKind::Getter { name } if name == "locked"));
-        assert!(algos[0].steps[0].contains("ReadableStream"));
-        assert!(algos[1].steps[0].contains("WritableStream"));
+        assert!(algos[0].steps[0].text.contains("ReadableStream"));
+        assert!(algos[1].steps[0].text.contains("WritableStream"));
     }
 
     #[test]
@@ -2545,5 +2726,304 @@ interface WorkerLocation {
         let algos = extract_algorithms(html);
         assert_eq!(algos.len(), 1);
         assert_eq!(algos[0].fragment, "rs-locked");
+    }
+
+    #[test]
+    fn nested_ol_substeps_get_dotted_labels() {
+        let html = r#"
+            <html><body>
+            <p>To frob a widget:</p>
+            <ol>
+                <li><p>Let <var>x</var> be 0.</p></li>
+                <li><p>While true:</p>
+                    <ol>
+                        <li><p>Increment <var>x</var>.</p></li>
+                        <li><p>If <var>x</var> is 3, then:</p>
+                            <ol><li><p>Break.</p></li></ol>
+                        </li>
+                    </ol>
+                </li>
+                <li><p>Return <var>x</var>.</p></li>
+            </ol>
+            </body></html>
+        "#;
+
+        let algos = extract_algorithms(html);
+        assert_eq!(algos.len(), 1);
+        let steps = &algos[0].steps;
+        let labels: Vec<&str> = steps.iter().map(|s| s.label.as_str()).collect();
+        assert_eq!(labels, ["1", "2", "2.1", "2.2", "2.2.1", "3"]);
+        assert_eq!(steps[1].text, "While true:");
+        assert_eq!(steps[3].text, "If _x_ is 3, then:");
+        assert_eq!(steps[4].text, "Break.");
+    }
+
+    #[test]
+    fn switch_branches_get_labeled_steps() {
+        let html = r#"
+            <html><body>
+            <p>To process a widget:</p>
+            <ol>
+                <li><p>Switch on <var>object</var>:</p>
+                    <dl class="switch">
+                        <dt><code>Blob</code></dt>
+                        <dd><p>Set <var>source</var> to <var>object</var>.</p>
+                            <p>Set <var>length</var> to <var>object</var>’s size.</p></dd>
+                        <dt><a href="x">byte sequence</a></dt>
+                        <dd><p>Set <var>source</var> to <var>object</var>.</p></dd>
+                    </dl>
+                </li>
+                <li><p>Return <var>source</var>.</p></li>
+            </ol>
+            </body></html>
+        "#;
+
+        let algos = extract_algorithms(html);
+        assert_eq!(algos.len(), 1);
+        let steps = &algos[0].steps;
+        let labels: Vec<&str> = steps.iter().map(|s| s.label.as_str()).collect();
+        assert_eq!(labels, ["1", "1 `Blob`", "1 `byte sequence`", "2"]);
+        assert_eq!(steps[0].text, "Switch on _object_:");
+        assert_eq!(
+            steps[1].text,
+            "Set _source_ to _object_. Set _length_ to _object_’s size."
+        );
+        assert_eq!(steps[2].text, "Set _source_ to _object_.");
+    }
+
+    #[test]
+    fn switch_branch_with_substeps_gets_dotted_branch_labels() {
+        let html = r#"
+            <html><body>
+            <p>To process a widget:</p>
+            <ol>
+                <li><p>Switch on <var>state</var>:</p>
+                    <dl class="switch">
+                        <dt><code>ready</code></dt>
+                        <dd>
+                            <ol>
+                                <li><p>Let <var>a</var> be 1.</p></li>
+                                <li><p>Return <var>a</var>.</p></li>
+                            </ol>
+                        </dd>
+                    </dl>
+                </li>
+            </ol>
+            </body></html>
+        "#;
+
+        let algos = extract_algorithms(html);
+        assert_eq!(algos.len(), 1);
+        let steps = &algos[0].steps;
+        let labels: Vec<&str> = steps.iter().map(|s| s.label.as_str()).collect();
+        assert_eq!(labels, ["1", "1 `ready`.1", "1 `ready`.2"]);
+        assert_eq!(steps[1].text, "Let _a_ be 1.");
+    }
+
+    #[test]
+    fn switch_branch_labels_collapse_nested_code_link_backticks() {
+        let html = r#"
+            <html><body>
+            <p>To process a widget:</p>
+            <ol>
+                <li><p>Switch on <var>object</var>:</p>
+                    <dl class="switch">
+                        <dt><code class="idl"><a href="x">Blob</a></code></dt>
+                        <dd><p>Return true.</p></dd>
+                    </dl>
+                </li>
+            </ol>
+            </body></html>
+        "#;
+
+        let algos = extract_algorithms(html);
+        assert_eq!(algos.len(), 1);
+        let labels: Vec<&str> = algos[0].steps.iter().map(|s| s.label.as_str()).collect();
+        assert_eq!(labels, ["1", "1 `Blob`"]);
+    }
+
+    #[test]
+    fn multiple_dts_share_one_branch_label() {
+        let html = r#"
+            <html><body>
+            <p>To process a widget:</p>
+            <ol>
+                <li><p>Switch on <var>unit</var>:</p>
+                    <dl class="switch">
+                        <dt><code>day</code></dt>
+                        <dt><code>week</code></dt>
+                        <dd><p>Return true.</p></dd>
+                    </dl>
+                </li>
+            </ol>
+            </body></html>
+        "#;
+
+        let algos = extract_algorithms(html);
+        assert_eq!(algos.len(), 1);
+        let steps = &algos[0].steps;
+        let labels: Vec<&str> = steps.iter().map(|s| s.label.as_str()).collect();
+        assert_eq!(labels, ["1", "1 `day`, `week`"]);
+        assert_eq!(steps[1].text, "Return true.");
+    }
+
+    #[test]
+    fn div_algorithm_with_top_level_ul_gets_bullet_step() {
+        let html = r#"
+            <html><body>
+            <div class="algorithm" data-algorithm="CORS-unsafe request-header byte">
+                <p>A <dfn id="cors-unsafe-request-header-byte">CORS-unsafe request-header byte</dfn> is a byte <var>byte</var> for which one of the following is true:</p>
+                <ul class="brief">
+                    <li><p><var>byte</var> is less than 0x20 and is not 0x09 HT</p></li>
+                    <li><p><var>byte</var> is 0x22 (")</p></li>
+                </ul>
+            </div>
+            </body></html>
+        "#;
+
+        let algos = extract_algorithms(html);
+        assert_eq!(algos.len(), 1);
+        // The heading must stop before the list, not swallow it.
+        assert_eq!(
+            algos[0].heading,
+            "A CORS-unsafe request-header byte is a byte byte for which one of the following is true:"
+        );
+        let steps = &algos[0].steps;
+        assert_eq!(steps.len(), 1);
+        assert_eq!(steps[0].label, "1");
+        assert_eq!(
+            steps[0].text,
+            "A CORS-unsafe request-header byte is a byte _byte_ for which one of the following is true:\n- _byte_ is less than 0x20 and is not 0x09 HT\n- _byte_ is 0x22 (\")"
+        );
+    }
+
+    #[test]
+    fn div_algorithm_with_top_level_switch_gets_branch_steps() {
+        let html = r#"
+            <html><body>
+            <div class="algorithm" data-algorithm="frob a widget">
+                <p>To <dfn id="frob">frob a widget</dfn>, switch on <var>kind</var>:</p>
+                <dl class="switch">
+                    <dt><code>gadget</code></dt>
+                    <dd><p>Return true.</p></dd>
+                </dl>
+            </div>
+            </body></html>
+        "#;
+
+        let algos = extract_algorithms(html);
+        assert_eq!(algos.len(), 1);
+        assert_eq!(algos[0].heading, "To frob a widget, switch on kind:");
+        let labels: Vec<&str> = algos[0].steps.iter().map(|s| s.label.as_str()).collect();
+        assert_eq!(labels, ["1", "1 `gadget`"]);
+        assert_eq!(algos[0].steps[0].text, "To frob a widget, switch on _kind_:");
+        assert_eq!(algos[0].steps[1].text, "Return true.");
+    }
+
+    #[test]
+    fn div_algorithm_with_switch_holding_ols_keeps_all_branches() {
+        // URL spec "origin" shape: the algorithm body is a top-level
+        // <dl class="switch"> whose arms contain the <ol>s. The first arm's
+        // list must not be mistaken for the whole algorithm's steps.
+        let html = r#"
+            <html><body>
+            <div class="algorithm" data-algorithm="origin" data-algorithm-for="url">
+                <p>The <dfn id="concept-url-origin">origin</dfn> of a URL <var>url</var> is computed by switching on <var>url</var>’s scheme:</p>
+                <dl class="switch">
+                    <dt>"<code>blob</code>"</dt>
+                    <dd>
+                        <ol>
+                            <li><p>Let <var>pathURL</var> be the path.</p></li>
+                            <li><p>Return <var>pathURL</var>’s origin.</p></li>
+                        </ol>
+                    </dd>
+                    <dt>"<code>file</code>"</dt>
+                    <dd><p>Return an opaque origin.</p></dd>
+                </dl>
+            </div>
+            </body></html>
+        "#;
+
+        let algos = extract_algorithms(html);
+        assert_eq!(algos.len(), 1);
+        let labels: Vec<&str> = algos[0].steps.iter().map(|s| s.label.as_str()).collect();
+        assert_eq!(
+            labels,
+            [
+                "1",
+                "1 \"`blob`\".1",
+                "1 \"`blob`\".2",
+                "1 \"`file`\""
+            ]
+        );
+        assert_eq!(algos[0].steps[3].text, "Return an opaque origin.");
+    }
+
+    #[test]
+    fn outer_algorithm_does_not_steal_nested_algorithm_steps() {
+        // Streams spec "read all bytes" shape: a one-liner algorithm div
+        // containing a nested algorithm div that has the only <ol>.
+        let html = r#"
+            <html><body>
+            <div class="algorithm" data-algorithm="read all bytes">
+                <p>To <dfn id="read-all-bytes">read all bytes</dfn> from a reader <var>reader</var>: <a href="x">read-loop</a> given <var>reader</var> and a new byte sequence.</p>
+                <div class="algorithm" data-algorithm="read-loop">
+                    To <dfn id="read-loop">read-loop</dfn> given <var>reader</var> and <var>bytes</var>:
+                    <ol>
+                        <li><p>Let <var>readRequest</var> be a new read request.</p></li>
+                        <li><p>Perform <var>readRequest</var>.</p></li>
+                    </ol>
+                </div>
+            </div>
+            </body></html>
+        "#;
+
+        let algos = extract_algorithms(html);
+        assert_eq!(algos.len(), 2);
+        let outer = algos
+            .iter()
+            .find(|a| matches!(&a.kind, AlgorithmKind::Standalone { name } if name.contains("read all bytes")))
+            .unwrap();
+        let inner = algos
+            .iter()
+            .find(|a| matches!(&a.kind, AlgorithmKind::Standalone { name } if name.contains("read-loop")))
+            .unwrap();
+
+        // The outer algorithm's heading and steps must not include the nested
+        // algorithm's content.
+        assert!(!outer.heading.contains("readRequest"));
+        assert_eq!(outer.steps.len(), 1);
+        assert!(!outer.steps[0].text.contains("readRequest"));
+        // The nested algorithm still gets its own numbered steps.
+        assert_eq!(inner.steps.len(), 2);
+        assert_eq!(inner.steps[0].label, "1");
+    }
+
+    #[test]
+    fn ul_items_become_bullet_lines() {
+        let html = r#"
+            <html><body>
+            <p>To check a request:</p>
+            <ol>
+                <li><p>If all of the following conditions are true:</p>
+                    <ul>
+                        <li><p><var>request</var>’s mode is "<code>cors</code>"</p></li>
+                        <li><p><var>request</var>’s client is not null</p></li>
+                    </ul>
+                    <p>then return true.</p>
+                </li>
+            </ol>
+            </body></html>
+        "#;
+
+        let algos = extract_algorithms(html);
+        assert_eq!(algos.len(), 1);
+        let steps = &algos[0].steps;
+        assert_eq!(steps.len(), 1);
+        assert_eq!(steps[0].label, "1");
+        assert_eq!(
+            steps[0].text,
+            "If all of the following conditions are true:\n- _request_’s mode is \"`cors`\"\n- _request_’s client is not null\nthen return true."
+        );
     }
 }

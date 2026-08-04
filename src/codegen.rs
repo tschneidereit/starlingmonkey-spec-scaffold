@@ -11,7 +11,7 @@ use std::path::Path;
 
 use heck::ToSnakeCase;
 
-use crate::extract::SpecDefinitions;
+use crate::extract::{SpecDefinitions, Step};
 use crate::idl::{
     Algorithm, Attribute, Callback, Constant, Constructor, Dictionary, Enum, Interface, Method,
     Param, SpecModel, Typedef,
@@ -470,7 +470,7 @@ fn collect_interface_imports(iface: &Interface, imports: &mut ImportSet) {
     let has_methods = !iface.methods.is_empty() || !iface.static_methods.is_empty();
     let ctor_can_throw = iface.constructor.as_ref().is_some_and(|ctor| {
         ctor.algorithm_steps.iter().any(|s| {
-            let lower = s.to_lowercase();
+            let lower = s.text.to_lowercase();
             lower.contains("throw") || lower.contains("exception")
         })
     });
@@ -663,7 +663,7 @@ fn write_constructor(
 
     // Detect if this constructor can throw by scanning algorithm steps.
     let can_throw = ctor.algorithm_steps.iter().any(|s| {
-        let lower = s.to_lowercase();
+        let lower = s.text.to_lowercase();
         lower.contains("throw") || lower.contains("exception")
     });
 
@@ -977,29 +977,81 @@ fn format_return_type(rt: &crate::types::RustType) -> String {
     }
 }
 
-/// Write algorithm steps as numbered comments inside a function body, wrapped at 100 columns.
-fn write_step_comments(out: &mut String, steps: &[String], indent: usize) {
-    for (i, step) in steps.iter().enumerate() {
-        write_wrapped_step(out, i + 1, step, indent);
+/// Write algorithm steps as labeled comments inside a function body, wrapped at 100 columns.
+fn write_step_comments(out: &mut String, steps: &[Step], indent: usize) {
+    for step in steps {
+        write_wrapped_step(out, &step.label, &step.text, indent);
     }
 }
 
 /// Write a single step comment, word-wrapping at 100 columns with aligned continuation.
-fn write_wrapped_step(out: &mut String, step_num: usize, text: &str, indent: usize) {
-    let step_marker = format!("Step {step_num}: ");
-    let prefix = format!("{:indent$}// {step_marker}", "");
-    let cont_pad = " ".repeat(step_marker.len());
-    let cont_prefix = format!("{:indent$}// {cont_pad}", "");
-    let available = 100usize.saturating_sub(prefix.len());
+///
+/// The text may contain newline-separated segments (e.g. "- "-prefixed bullet
+/// lines from unordered sub-lists); each segment starts on its own line, and
+/// continuation lines of a bullet are indented past its marker.
+fn write_wrapped_step(out: &mut String, label: &str, text: &str, indent: usize) {
+    let prefix = format!("{:indent$}// Step {label}: ", "");
+    // Continuation lines use a fixed four-space indent rather than aligning
+    // under the step marker; bullet markers are placed so the bullet text
+    // (and its continuation lines) lines up with the continuation indent.
+    let cont_prefix = format!("{:indent$}//     ", "");
+    let bullet_prefix = format!("{:indent$}//   ", "");
+    let bullet_cont_prefix = format!("{:indent$}//     ", "");
 
-    let lines = word_wrap(text, available);
-    for (j, line) in lines.iter().enumerate() {
-        if j == 0 {
-            writeln!(out, "{prefix}{line}").unwrap();
+    let mut first_line = true;
+    for segment in text.split('\n') {
+        let is_bullet = segment.starts_with("- ");
+        let (start_prefix, rest_prefix) = if first_line {
+            (&prefix, &cont_prefix)
+        } else if is_bullet {
+            (&bullet_prefix, &bullet_cont_prefix)
         } else {
-            writeln!(out, "{cont_prefix}{line}").unwrap();
+            (&cont_prefix, &cont_prefix)
+        };
+        let lines = word_wrap_two_widths(
+            segment,
+            100usize.saturating_sub(start_prefix.len()),
+            100usize.saturating_sub(rest_prefix.len()),
+        );
+        for (j, line) in lines.iter().enumerate() {
+            let line_prefix = if j == 0 { start_prefix } else { rest_prefix };
+            writeln!(out, "{line_prefix}{line}").unwrap();
+        }
+        first_line = false;
+    }
+}
+
+/// Word-wrap text where the first line has `first_width` columns available
+/// and subsequent lines have `rest_width`.
+fn word_wrap_two_widths(text: &str, first_width: usize, rest_width: usize) -> Vec<String> {
+    if first_width == 0 || text.is_empty() {
+        return vec![text.to_string()];
+    }
+    let mut lines = Vec::new();
+    let mut current = String::new();
+    for word in text.split_whitespace() {
+        let width = if lines.is_empty() {
+            first_width
+        } else {
+            rest_width
+        };
+        if current.is_empty() {
+            current.push_str(word);
+        } else if current.len() + 1 + word.len() > width {
+            lines.push(current);
+            current = word.to_string();
+        } else {
+            current.push(' ');
+            current.push_str(word);
         }
     }
+    if !current.is_empty() {
+        lines.push(current);
+    }
+    if lines.is_empty() {
+        lines.push(String::new());
+    }
+    lines
 }
 
 /// Word-wrap text to the given width, breaking at word boundaries.
@@ -1956,8 +2008,8 @@ fn generate_algorithms(algorithms: &[Algorithm], spec_url: &str) -> String {
     out
 }
 
-/// Write algorithm steps as numbered comments with standard (4-space) indentation.
-fn write_step_comments_unindented(out: &mut String, steps: &[String]) {
+/// Write algorithm steps as labeled comments with standard (4-space) indentation.
+fn write_step_comments_unindented(out: &mut String, steps: &[Step]) {
     write_step_comments(out, steps, 4);
 }
 
@@ -2409,7 +2461,7 @@ interface Headers {
         let mut model_with_throw = model;
         model_with_throw.interfaces[0].constructor = Some(Constructor {
             params: vec![],
-            algorithm_steps: vec!["If init is not valid, throw a TypeError.".to_string()],
+            algorithm_steps: vec![Step::numbered(1, "If init is not valid, throw a TypeError.")],
         });
 
         let files = generate(
@@ -2541,7 +2593,7 @@ interface Response {
 
     #[test]
     fn algorithm_functions_are_pub_crate() {
-        use crate::extract::{AlgorithmKind, AlgorithmSteps};
+        use crate::extract::{AlgorithmKind, AlgorithmSteps, Step};
 
         let idl_text = "";
         let algorithms = vec![AlgorithmSteps {
@@ -2549,7 +2601,7 @@ interface Response {
             kind: AlgorithmKind::Standalone {
                 name: "create a readable stream".to_string(),
             },
-            steps: vec!["Do something.".to_string()],
+            steps: vec![Step::numbered(1, "Do something.")],
             interface: String::new(),
             fragment: String::new(),
         }];
@@ -2573,14 +2625,14 @@ interface Response {
 
     #[test]
     fn algorithm_doc_comment_includes_spec_link() {
-        use crate::extract::{AlgorithmKind, AlgorithmSteps};
+        use crate::extract::{AlgorithmKind, AlgorithmSteps, Step};
 
         let algorithms = vec![AlgorithmSteps {
             heading: "To slice blob, run these steps:".to_string(),
             kind: AlgorithmKind::Standalone {
                 name: "slice blob".to_string(),
             },
-            steps: vec!["Let blob be a new Blob.".to_string()],
+            steps: vec![Step::numbered(1, "Let blob be a new Blob.")],
             interface: String::new(),
             fragment: "slice-blob".to_string(),
         }];
@@ -2607,14 +2659,14 @@ interface Response {
 
     #[test]
     fn algorithm_without_fragment_omits_spec_link() {
-        use crate::extract::{AlgorithmKind, AlgorithmSteps};
+        use crate::extract::{AlgorithmKind, AlgorithmSteps, Step};
 
         let algorithms = vec![AlgorithmSteps {
             heading: "To do something:".to_string(),
             kind: AlgorithmKind::Standalone {
                 name: "do something".to_string(),
             },
-            steps: vec!["Do it.".to_string()],
+            steps: vec![Step::numbered(1, "Do it.")],
             interface: String::new(),
             fragment: String::new(),
         }];
@@ -3230,7 +3282,7 @@ interface EventTarget {
 
     #[test]
     fn global_method_without_webidl_creates_globals_rs() {
-        use crate::extract::{AlgorithmKind, AlgorithmSteps};
+        use crate::extract::{AlgorithmKind, AlgorithmSteps, Step};
 
         // No WebIDL — only method algorithms on WindowOrWorkerGlobalScope
         let algorithms = vec![AlgorithmSteps {
@@ -3239,7 +3291,7 @@ interface EventTarget {
                 name: "structuredClone".to_string(),
                 is_static: false,
             },
-            steps: vec!["Let serialized be ...".to_string()],
+            steps: vec![Step::numbered(1, "Let serialized be ...")],
             interface: "WindowOrWorkerGlobalScope".to_string(),
             fragment: String::new(),
         }];
@@ -3517,5 +3569,80 @@ interface Widget {
             widget.content.contains("HandleValue"),
             "should collapse sequence<UnionTypedef> to HandleValue"
         );
+    }
+
+    #[test]
+    fn step_comments_use_hierarchical_labels() {
+        let steps = vec![
+            Step {
+                label: "5".to_string(),
+                text: "While true:".to_string(),
+            },
+            Step {
+                label: "5.1".to_string(),
+                text: "Advance position by 1.".to_string(),
+            },
+            Step {
+                label: "10 `Blob`".to_string(),
+                text: "Set source to object.".to_string(),
+            },
+        ];
+        let mut out = String::new();
+        write_step_comments(&mut out, &steps, 4);
+        assert_eq!(
+            out,
+            "    // Step 5: While true:\n\
+             \x20   // Step 5.1: Advance position by 1.\n\
+             \x20   // Step 10 `Blob`: Set source to object.\n"
+        );
+    }
+
+    #[test]
+    fn step_comments_render_bullet_lines() {
+        let steps = vec![Step {
+            label: "1".to_string(),
+            text: "If all of the following are true:\n- mode is \"cors\"\n- client is not null\nthen return true."
+                .to_string(),
+        }];
+        let mut out = String::new();
+        write_step_comments(&mut out, &steps, 4);
+        assert_eq!(
+            out,
+            "    // Step 1: If all of the following are true:\n\
+             \x20   //   - mode is \"cors\"\n\
+             \x20   //   - client is not null\n\
+             \x20   //     then return true.\n"
+        );
+    }
+
+    #[test]
+    fn wrapped_step_lines_use_fixed_continuation_indent() {
+        let steps = vec![Step {
+            label: "9 scheme state.2.6.1".to_string(),
+            text: "word ".repeat(30).trim().to_string(),
+        }];
+        let mut out = String::new();
+        write_step_comments(&mut out, &steps, 4);
+        let lines: Vec<&str> = out.lines().collect();
+        assert!(lines[0].starts_with("    // Step 9 scheme state.2.6.1: word"));
+        assert!(lines[1].starts_with("    //     word"));
+        // Continuation lines use the full width available at the fixed
+        // indent, not the width left over after the long step marker.
+        assert!(lines.iter().all(|l| l.len() <= 100));
+        assert!(lines[1].len() > 100 - "    // Step 9 scheme state.2.6.1: ".len() + 10);
+    }
+
+    #[test]
+    fn wrapped_bullet_lines_indent_past_the_marker() {
+        let steps = vec![Step {
+            label: "1".to_string(),
+            text: format!("All of:\n- {}", "word ".repeat(25).trim()),
+        }];
+        let mut out = String::new();
+        write_step_comments(&mut out, &steps, 4);
+        let lines: Vec<&str> = out.lines().collect();
+        assert_eq!(lines[0], "    // Step 1: All of:");
+        assert!(lines[1].starts_with("    //   - word"));
+        assert!(lines[2].starts_with("    //     word"));
     }
 }

@@ -11,7 +11,7 @@ use anyhow::Result;
 use weedle::interface::InterfaceMember;
 use weedle::mixin::MixinMember;
 
-use crate::extract::{AlgorithmKind, AlgorithmSteps, SpecDefinitions};
+use crate::extract::{AlgorithmKind, AlgorithmSteps, SpecDefinitions, Step};
 use crate::types::{map_return_type, map_type, RustType};
 
 /// Interface names that represent the global scope, not real interfaces.
@@ -64,7 +64,7 @@ pub struct Interface {
 #[derive(Debug, Clone)]
 pub struct Constructor {
     pub params: Vec<Param>,
-    pub algorithm_steps: Vec<String>,
+    pub algorithm_steps: Vec<Step>,
 }
 
 #[derive(Debug, Clone)]
@@ -73,9 +73,9 @@ pub struct Attribute {
     pub rust_type: RustType,
     pub readonly: bool,
     /// Getter algorithm steps, if any.
-    pub getter_steps: Vec<String>,
+    pub getter_steps: Vec<Step>,
     /// Setter algorithm steps, if any.
-    pub setter_steps: Vec<String>,
+    pub setter_steps: Vec<Step>,
 }
 
 #[derive(Debug, Clone)]
@@ -83,7 +83,7 @@ pub struct Method {
     pub name: String,
     pub params: Vec<Param>,
     pub return_type: RustType,
-    pub algorithm_steps: Vec<String>,
+    pub algorithm_steps: Vec<Step>,
 }
 
 #[derive(Debug, Clone)]
@@ -156,7 +156,7 @@ pub struct Callback {
 pub struct Algorithm {
     pub name: String,
     pub heading: String,
-    pub steps: Vec<String>,
+    pub steps: Vec<Step>,
     /// The URL fragment identifier for linking to this algorithm in the spec.
     pub fragment: String,
 }
@@ -281,7 +281,7 @@ fn add_method_to_global_interface(
     interface_name: &str,
     method_name: &str,
     heading: &str,
-    steps: &[String],
+    steps: &[Step],
 ) {
     let method = Method {
         name: method_name.to_string(),
@@ -1178,7 +1178,7 @@ fn lookup_method_steps(
     method_name: &str,
     is_static: bool,
     interface_name: &str,
-) -> Vec<String> {
+) -> Vec<Step> {
     lookup_steps(algorithms, interface_name, |kind| {
         matches!(
             kind,
@@ -1193,7 +1193,7 @@ fn lookup_getter_steps(
     algorithms: &[AlgorithmSteps],
     attr_name: &str,
     interface_name: &str,
-) -> Vec<String> {
+) -> Vec<Step> {
     lookup_steps(algorithms, interface_name, |kind| {
         matches!(
             kind,
@@ -1207,7 +1207,7 @@ fn lookup_setter_steps(
     algorithms: &[AlgorithmSteps],
     attr_name: &str,
     interface_name: &str,
-) -> Vec<String> {
+) -> Vec<Step> {
     lookup_steps(algorithms, interface_name, |kind| {
         matches!(
             kind,
@@ -1217,7 +1217,7 @@ fn lookup_setter_steps(
 }
 
 /// Look up constructor algorithm steps for a class by name.
-fn lookup_constructor_steps(algorithms: &[AlgorithmSteps], class_name: &str) -> Vec<String> {
+fn lookup_constructor_steps(algorithms: &[AlgorithmSteps], class_name: &str) -> Vec<Step> {
     lookup_steps(
         algorithms,
         class_name,
@@ -1233,7 +1233,7 @@ fn lookup_steps(
     algorithms: &[AlgorithmSteps],
     interface_name: &str,
     matches_kind: impl Fn(&AlgorithmKind) -> bool,
-) -> Vec<String> {
+) -> Vec<Step> {
     // Pass 1: interface-scoped match.
     if let Some(algo) = algorithms
         .iter()
