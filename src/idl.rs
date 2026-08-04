@@ -248,7 +248,16 @@ pub fn parse_idl(
             }
             _ => continue,
         };
-        if !model.algorithms.iter().any(|a| a.name == name) {
+        // Dedup repeated extractions of the same algorithm (same name AND same
+        // spec anchor). Distinct algorithms can share a name — e.g. the fetch
+        // spec defines "append" for both header lists and Headers objects —
+        // and must all be kept; codegen disambiguates colliding function
+        // names with numeric suffixes.
+        if !model
+            .algorithms
+            .iter()
+            .any(|a| a.name == name && a.fragment == algo.fragment)
+        {
             model.algorithms.push(Algorithm {
                 name,
                 heading: algo.heading.clone(),
@@ -1561,6 +1570,50 @@ interface File : Blob {
             name_attr.rust_type.text, "String",
             "DOMString should map to String, not be replaced"
         );
+    }
+
+    #[test]
+    fn standalone_algorithms_with_same_name_but_different_fragments_are_kept() {
+        // The fetch spec defines "append" both for header lists
+        // (#concept-header-list-append) and for Headers objects
+        // (#concept-headers-append). Both may classify to the same standalone
+        // name; distinct spec anchors must still yield distinct algorithms.
+        let make = |fragment: &str, heading: &str| AlgorithmSteps {
+            heading: heading.to_string(),
+            kind: AlgorithmKind::Standalone {
+                name: "append a header".to_string(),
+            },
+            steps: vec![Step::numbered(1, "Do something.")],
+            interface: String::new(),
+            fragment: fragment.to_string(),
+        };
+        let algos = vec![
+            make(
+                "concept-header-list-append",
+                "To append a header (name, value) to a header list list:",
+            ),
+            make(
+                "concept-headers-append",
+                "To append a header (name, value) to a Headers object headers, run these steps:",
+            ),
+            // Exact duplicate of the first (same name AND fragment): still deduped.
+            make(
+                "concept-header-list-append",
+                "To append a header (name, value) to a header list list:",
+            ),
+        ];
+
+        let model = parse_idl(&[], &algos, &Default::default()).unwrap();
+        assert_eq!(
+            model.algorithms.len(),
+            2,
+            "distinct fragments must both be kept, identical ones deduped: {:?}",
+            model.algorithms.iter().map(|a| &a.fragment).collect::<Vec<_>>()
+        );
+        assert!(model
+            .algorithms
+            .iter()
+            .any(|a| a.fragment == "concept-headers-append"));
     }
 
     #[test]

@@ -58,7 +58,8 @@ impl Step {
 /// An algorithm extracted from spec prose, associated with a method or concept.
 #[derive(Debug, Clone)]
 pub struct AlgorithmSteps {
-    /// The heading text that introduces the algorithm.
+    /// The heading text that introduces the algorithm, with inline markup kept
+    /// as annotations (`` `link` ``, `_var_`, …) the same way step text is.
     pub heading: String,
     /// What kind of construct this algorithm is for.
     pub kind: AlgorithmKind,
@@ -138,6 +139,10 @@ pub fn extract_algorithms(html: &str) -> Vec<AlgorithmSteps> {
             continue;
         }
 
+        // The heading is reported with its inline markup preserved; only
+        // classification above runs on the plain text.
+        let formatted = normalize_whitespace(&extract_formatted_text(&element));
+
         // Extract the interface name from a nested <dfn data-dfn-for> if present.
         // FileAPI-style specs define methods inside <p> elements that contain
         // <dfn data-dfn-for="Blob" data-dfn-type="method"> tags.
@@ -159,10 +164,10 @@ pub fn extract_algorithms(html: &str) -> Vec<AlgorithmSteps> {
 
         if is_one_liner {
             // Extract the description from the heading itself
-            let description = extract_one_liner_description(&text);
+            let description = extract_one_liner_description(&formatted);
             for kind in kinds {
                 results.push(AlgorithmSteps {
-                    heading: text.clone(),
+                    heading: formatted.clone(),
                     kind,
                     steps: vec![Step::numbered(1, description.clone())],
                     interface: interface.clone(),
@@ -185,7 +190,7 @@ pub fn extract_algorithms(html: &str) -> Vec<AlgorithmSteps> {
                 if !steps.is_empty() {
                     for kind in &kinds {
                         results.push(AlgorithmSteps {
-                            heading: text.clone(),
+                            heading: formatted.clone(),
                             kind: kind.clone(),
                             steps: steps.clone(),
                             interface: interface.clone(),
@@ -251,9 +256,11 @@ pub fn extract_algorithms(html: &str) -> Vec<AlgorithmSteps> {
             .unwrap_or_default()
             .to_string();
 
-        // Collect heading text: all text content before the first <ol> child.
-        let heading_text = extract_div_algorithm_heading(&element);
-        let text = normalize_whitespace(&heading_text);
+        // Collect heading text: all content before the first <ol> child, once
+        // as plain text (what classification matches against) and once with
+        // inline markup preserved (what gets reported).
+        let text = normalize_whitespace(&extract_div_algorithm_heading(&element, false));
+        let formatted = normalize_whitespace(&extract_div_algorithm_heading(&element, true));
 
         // Classification priority for algorithm divs:
         // 1. Textual pattern matching on heading prose (most specific — captures
@@ -290,7 +297,7 @@ pub fn extract_algorithms(html: &str) -> Vec<AlgorithmSteps> {
             if !steps.is_empty() {
                 for kind in &kinds {
                     results.push(AlgorithmSteps {
-                        heading: text.clone(),
+                        heading: formatted.clone(),
                         kind: kind.clone(),
                         steps: steps.clone(),
                         interface: interface.clone(),
@@ -312,7 +319,7 @@ pub fn extract_algorithms(html: &str) -> Vec<AlgorithmSteps> {
             if !steps.is_empty() {
                 for kind in kinds {
                     results.push(AlgorithmSteps {
-                        heading: text.clone(),
+                        heading: formatted.clone(),
                         kind,
                         steps: steps.clone(),
                         interface: interface.clone(),
@@ -321,20 +328,20 @@ pub fn extract_algorithms(html: &str) -> Vec<AlgorithmSteps> {
                 }
             }
         } else {
-            // No step-bearing block at all — treat the entire heading as a
-            // one-liner description.
+            // No step-bearing block at all — the heading is the algorithm's
+            // entire prose, so it also becomes the single step comment.
             let is_one_liner = is_one_liner_algorithm(&text);
             let description = if is_one_liner {
-                extract_one_liner_description(&text)
+                extract_one_liner_description(&formatted)
             } else {
                 // Extract a useful description from the heading text by stripping
                 // the introductory phrase.
-                extract_div_oneliner_description(&text)
+                extract_div_oneliner_description(&formatted)
             };
             if !description.is_empty() {
                 for kind in kinds {
                     results.push(AlgorithmSteps {
-                        heading: text.clone(),
+                        heading: formatted.clone(),
                         kind,
                         steps: vec![Step::numbered(1, description.clone())],
                         interface: interface.clone(),
@@ -353,7 +360,12 @@ pub fn extract_algorithms(html: &str) -> Vec<AlgorithmSteps> {
 /// Collects all text content from nodes before the first step-bearing block
 /// child (`<ol>`, `<ul>`, or `<dl class="switch">`) or nested algorithm div,
 /// which is the algorithm heading (e.g., "The cancel(reason) method steps are:").
-fn extract_div_algorithm_heading(div: &ElementRef) -> String {
+///
+/// With `formatted`, inline markup is preserved as annotations (`` `link` ``,
+/// `_var_`, …), the same way step text is; this is used when the heading itself
+/// becomes the algorithm's description, so prose-only algorithms read like
+/// regular steps. Heading classification uses the plain variant.
+fn extract_div_algorithm_heading(div: &ElementRef, formatted: bool) -> String {
     let mut heading = String::new();
     for child in div.children() {
         if let Some(child_el) = ElementRef::wrap(child) {
@@ -361,7 +373,11 @@ fn extract_div_algorithm_heading(div: &ElementRef) -> String {
                 break;
             }
             // Recurse into inline elements (dfn, code, etc.) to get their text
-            heading.push_str(&child_el.text().collect::<String>());
+            if formatted {
+                heading.push_str(&format_element(&child_el));
+            } else {
+                heading.push_str(&child_el.text().collect::<String>());
+            }
         } else if let Node::Text(t) = child.value() {
             heading.push_str(t);
         }
@@ -1088,30 +1104,24 @@ fn extract_formatted_text(element: &ElementRef) -> String {
     let mut result = String::new();
     for child in element.children() {
         if let Some(child_el) = ElementRef::wrap(child) {
-            let inner = extract_formatted_text(&child_el);
-            match child_el.value().name() {
-                "a" | "code" => {
-                    result.push('`');
-                    result.push_str(&inner);
-                    result.push('`');
-                }
-                "em" | "i" | "var" => {
-                    result.push('_');
-                    result.push_str(&inner);
-                    result.push('_');
-                }
-                "strong" | "b" => {
-                    result.push('*');
-                    result.push_str(&inner);
-                    result.push('*');
-                }
-                _ => result.push_str(&inner),
-            }
+            result.push_str(&format_element(&child_el));
         } else if let Node::Text(t) = child.value() {
             result.push_str(t);
         }
     }
     result
+}
+
+/// Format a single element, applying the annotation for its own tag around its
+/// formatted content.
+fn format_element(element: &ElementRef) -> String {
+    let inner = extract_formatted_text(element);
+    match element.value().name() {
+        "a" | "code" => format!("`{inner}`"),
+        "em" | "i" | "var" => format!("_{inner}_"),
+        "strong" | "b" => format!("*{inner}*"),
+        _ => inner,
+    }
 }
 
 /// Collapse runs of whitespace (including newlines) into single spaces and trim.
@@ -1369,9 +1379,12 @@ fn classify_as_standalone(text: &str) -> Option<AlgorithmKind> {
     // "To initialize a URL object..." / "To update a URLSearchParams object..."
     if lower.starts_with("to ") {
         let rest = &text[3..];
-        // Take the verb phrase up to the first comma, period, or colon
-        let end = rest.find([',', ':', '.']).unwrap_or(rest.len());
-        let mut name = rest[..end].trim().to_string();
+        // Take the verb phrase up to the first comma, period, or colon —
+        // but not one inside a parenthesized parameter list like "(name, value)",
+        // which would truncate the name mid-list and collide algorithms that
+        // share a verb (e.g. the fetch spec's two "append" algorithms).
+        let end = find_outside_parens(rest, &[',', ':', '.']).unwrap_or(rest.len());
+        let mut name = strip_paren_groups(&rest[..end]);
         strip_param_description(&mut name);
         if !name.is_empty() {
             return Some(AlgorithmKind::Standalone { name });
@@ -1438,6 +1451,37 @@ fn classify_as_standalone(text: &str) -> Option<AlgorithmKind> {
     }
 
     None
+}
+
+/// Find the first occurrence of any of `needles` in `text` that is not
+/// inside parentheses.
+fn find_outside_parens(text: &str, needles: &[char]) -> Option<usize> {
+    let mut depth = 0usize;
+    for (i, c) in text.char_indices() {
+        match c {
+            '(' => depth += 1,
+            ')' => depth = depth.saturating_sub(1),
+            c if depth == 0 && needles.contains(&c) => return Some(i),
+            _ => {}
+        }
+    }
+    None
+}
+
+/// Remove parenthesized groups (parameter lists like "(name, value)") from an
+/// algorithm name and collapse the whitespace they leave behind.
+fn strip_paren_groups(text: &str) -> String {
+    let mut out = String::new();
+    let mut depth = 0usize;
+    for c in text.chars() {
+        match c {
+            '(' => depth += 1,
+            ')' => depth = depth.saturating_sub(1),
+            _ if depth == 0 => out.push(c),
+            _ => {}
+        }
+    }
+    normalize_whitespace(&out)
 }
 
 /// Strip trailing parameter descriptions from an algorithm name.
@@ -1686,6 +1730,31 @@ interface WorkerLocation {
     }
 
     #[test]
+    fn classify_standalone_ignores_commas_inside_parens() {
+        // The comma inside "(name, value)" must not truncate the name, and the
+        // parenthesized parameter list is dropped. Otherwise the header-list
+        // and Headers-object "append" algorithms of the fetch spec collapse to
+        // the identical name "append a header (name".
+        let kinds = classify_heading(
+            "To append a header (name, value) to a Headers object headers, run these steps:",
+        );
+        assert_eq!(kinds.len(), 1);
+        assert!(
+            matches!(&kinds[0], AlgorithmKind::Standalone { name } if name == "append a header to a Headers object headers"),
+            "got: {:?}",
+            kinds[0]
+        );
+
+        let kinds = classify_heading("To append a header (name, value) to a header list list:");
+        assert_eq!(kinds.len(), 1);
+        assert!(
+            matches!(&kinds[0], AlgorithmKind::Standalone { name } if name == "append a header to a header list list"),
+            "got: {:?}",
+            kinds[0]
+        );
+    }
+
+    #[test]
     fn classify_standalone_takes() {
         let kinds = classify_heading(
             "The API URL parser takes a scalar value string url and an optional null-or-scalar value string base (default null), and then runs these steps:",
@@ -1717,6 +1786,46 @@ interface WorkerLocation {
         assert!(matches!(&algos[0].kind, AlgorithmKind::Getter { name } if name == "origin"));
         assert_eq!(algos[0].steps.len(), 1);
         assert!(algos[0].steps[0].text.starts_with("Return"));
+    }
+
+    #[test]
+    fn one_liner_algorithm_keeps_inline_markup() {
+        let html = r##"
+            <html><body>
+            <p>The <dfn>method</dfn> getter steps are to return <a href="#this">this</a>’s
+            <a href="#request">request</a>’s <var>method</var>.</p>
+            </body></html>
+        "##;
+
+        let algos = extract_algorithms(html);
+        assert_eq!(algos.len(), 1);
+        assert_eq!(
+            algos[0].steps[0].text,
+            "Return `this`’s `request`’s _method_."
+        );
+    }
+
+    #[test]
+    fn prose_only_algorithm_div_keeps_inline_markup() {
+        let html = r##"
+            <html><body>
+            <div class="algorithm" data-algorithm="contains" data-algorithm-for="header list">
+                <p>A <a href="#header-list">header list</a> <var>list</var>
+                <dfn id="header-list-contains">contains</dfn> a
+                <a href="#header-name">header name</a> <var>name</var> if <var>list</var>
+                <a href="#list-contain">contains</a> a matching
+                <a href="#header">header</a>.</p>
+            </div>
+            </body></html>
+        "##;
+
+        let algos = extract_algorithms(html);
+        assert_eq!(algos.len(), 1);
+        let expected = "A `header list` _list_ contains a `header name` _name_ \
+                        if _list_ `contains` a matching `header`.";
+        assert_eq!(algos[0].heading, expected);
+        assert_eq!(algos[0].steps.len(), 1);
+        assert_eq!(algos[0].steps[0].text, expected);
     }
 
     #[test]
@@ -2886,7 +2995,7 @@ interface WorkerLocation {
         // The heading must stop before the list, not swallow it.
         assert_eq!(
             algos[0].heading,
-            "A CORS-unsafe request-header byte is a byte byte for which one of the following is true:"
+            "A CORS-unsafe request-header byte is a byte _byte_ for which one of the following is true:"
         );
         let steps = &algos[0].steps;
         assert_eq!(steps.len(), 1);
@@ -2913,7 +3022,7 @@ interface WorkerLocation {
 
         let algos = extract_algorithms(html);
         assert_eq!(algos.len(), 1);
-        assert_eq!(algos[0].heading, "To frob a widget, switch on kind:");
+        assert_eq!(algos[0].heading, "To frob a widget, switch on _kind_:");
         let labels: Vec<&str> = algos[0].steps.iter().map(|s| s.label.as_str()).collect();
         assert_eq!(labels, ["1", "1 `gadget`"]);
         assert_eq!(algos[0].steps[0].text, "To frob a widget, switch on _kind_:");
