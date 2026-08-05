@@ -448,7 +448,7 @@ fn collect_step_body(body: &ElementRef, label: &str, out: &mut Vec<Step>) {
     let mut nested = Vec::new();
 
     let flush_inline = |inline: &mut String, lines: &mut Vec<String>| {
-        let text = normalize_whitespace(inline);
+        let text = normalize_step_text(inline);
         if !text.is_empty() {
             lines.push(text);
         }
@@ -462,16 +462,20 @@ fn collect_step_body(body: &ElementRef, label: &str, out: &mut Vec<Step>) {
                 "dl" if el.value().classes().any(|c| c == "switch") => {
                     nested.push(NestedBlock::Switch(el));
                 }
+                "dl" => {
+                    flush_inline(&mut inline, &mut lines);
+                    collect_dl_lines(&el, &mut lines);
+                }
                 "ul" => {
                     flush_inline(&mut inline, &mut lines);
                     for item in direct_child_elements(&el, "li") {
-                        let text = normalize_whitespace(&extract_formatted_text(&item));
+                        let text = normalize_step_text(&extract_formatted_text(&item));
                         if !text.is_empty() {
                             lines.push(format!("- {text}"));
                         }
                     }
                 }
-                _ => inline.push_str(&extract_formatted_text(&el)),
+                _ => inline.push_str(&format_element(&el)),
             }
         } else if let Node::Text(t) = child.value() {
             inline.push_str(t);
@@ -490,6 +494,31 @@ fn collect_step_body(body: &ElementRef, label: &str, out: &mut Vec<Step>) {
         match block {
             NestedBlock::Substeps(ol) => collect_ol_steps(&ol, label, out),
             NestedBlock::Switch(dl) => collect_switch_steps(&dl, label, out),
+        }
+    }
+}
+
+/// Collect `- name: value` bullet lines from a plain (non-switch) `<dl>`'s
+/// definition pairs, e.g. the request-property list in step 12 of the Request
+/// constructor. Consecutive `<dt>`s share the following `<dd>`'s value.
+fn collect_dl_lines(dl: &ElementRef, out: &mut Vec<String>) {
+    let mut names: Vec<String> = Vec::new();
+    for child in dl.children().filter_map(ElementRef::wrap) {
+        match child.value().name() {
+            "dt" => {
+                let text = normalize_whitespace(&extract_formatted_text(&child));
+                if !text.is_empty() {
+                    names.push(text);
+                }
+            }
+            "dd" => {
+                let value = normalize_step_text(&extract_formatted_text(&child));
+                if !names.is_empty() || !value.is_empty() {
+                    out.push(format!("- {}: {value}", names.join(", ")));
+                }
+                names.clear();
+            }
+            _ => {}
         }
     }
 }
@@ -1114,8 +1143,15 @@ fn extract_formatted_text(element: &ElementRef) -> String {
 
 /// Format a single element, applying the annotation for its own tag around its
 /// formatted content.
+///
+/// Elements with `class="note"` (spec-editorial asides, whatever their tag)
+/// become their own "Spec note: "-prefixed line; the newlines survive
+/// step-text normalization (see [`normalize_step_text`]).
 fn format_element(element: &ElementRef) -> String {
     let inner = extract_formatted_text(element);
+    if element.value().classes().any(|c| c == "note") {
+        return format!("{NOTE_BREAK}Spec note: {inner}{NOTE_BREAK}");
+    }
     match element.value().name() {
         "a" | "code" => format!("`{inner}`"),
         "em" | "i" | "var" => format!("_{inner}_"),
@@ -1124,12 +1160,33 @@ fn format_element(element: &ElementRef) -> String {
     }
 }
 
+/// Sentinel emitted by [`format_element`] around note content to mark line
+/// breaks. Source newlines can't serve as the marker — HTML indentation puts
+/// them everywhere — so a control character no spec text contains is used and
+/// resolved (or collapsed, in single-line contexts) during normalization.
+const NOTE_BREAK: char = '\u{1}';
+
+/// Normalize step text while keeping the line structure produced by
+/// [`format_element`] for notes: each note-delimited segment is
+/// whitespace-collapsed individually, and empty segments are dropped.
+fn normalize_step_text(text: &str) -> String {
+    text.split(NOTE_BREAK)
+        .map(normalize_whitespace)
+        .filter(|line| !line.is_empty())
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 /// Collapse runs of whitespace (including newlines) into single spaces and trim.
+///
+/// [`NOTE_BREAK`] markers count as whitespace, so single-line contexts
+/// (headings, switch conditions) inline note content instead of leaking the
+/// sentinel.
 pub fn normalize_whitespace(text: &str) -> String {
     let mut result = String::with_capacity(text.len());
     let mut prev_was_space = false;
     for ch in text.chars() {
-        if ch.is_whitespace() {
+        if ch.is_whitespace() || ch == NOTE_BREAK {
             if !prev_was_space && !result.is_empty() {
                 result.push(' ');
             }
@@ -3133,6 +3190,120 @@ interface WorkerLocation {
         assert_eq!(
             steps[0].text,
             "If all of the following conditions are true:\n- _request_’s mode is \"`cors`\"\n- _request_’s client is not null\nthen return true."
+        );
+    }
+
+    #[test]
+    fn dl_definitions_become_bullet_lines() {
+        // A plain (non-switch) <dl> inside a step holds name/value property
+        // pairs, e.g. step 12 of the Request constructor. Each dt/dd pair
+        // becomes a "- name: value" bullet line.
+        let html = r##"
+            <html><body>
+            <p>To make a request:</p>
+            <ol>
+                <li><p>Set <var>request</var> to a new <a href="#request">request</a> with the following properties:</p>
+                    <dl>
+                        <dt><a href="#url">URL</a>
+                        <dd><var>request</var>’s <a href="#url">URL</a>.
+                        <dt><a href="#unsafe">unsafe-request flag</a>
+                        <dd>Set.
+                    </dl>
+                </li>
+            </ol>
+            </body></html>
+        "##;
+
+        let algos = extract_algorithms(html);
+        assert_eq!(algos.len(), 1);
+        let steps = &algos[0].steps;
+        assert_eq!(steps.len(), 1);
+        assert_eq!(steps[0].label, "1");
+        assert_eq!(
+            steps[0].text,
+            "Set _request_ to a new `request` with the following properties:\n- `URL`: _request_’s `URL`.\n- `unsafe-request flag`: Set."
+        );
+    }
+
+    #[test]
+    fn multiple_dts_share_one_definition_line() {
+        let html = r##"
+            <html><body>
+            <p>To make a request:</p>
+            <ol>
+                <li><p>Set <var>request</var> to a new request with the following properties:</p>
+                    <dl>
+                        <dt><a href="#mode">mode</a>
+                        <dt><a href="#cache">cache mode</a>
+                        <dd><var>request</var>’s <a href="#mode">mode</a>.
+                    </dl>
+                </li>
+            </ol>
+            </body></html>
+        "##;
+
+        let algos = extract_algorithms(html);
+        assert_eq!(algos.len(), 1);
+        let steps = &algos[0].steps;
+        assert_eq!(steps.len(), 1);
+        assert_eq!(
+            steps[0].text,
+            "Set _request_ to a new request with the following properties:\n- `mode`, `cache mode`: _request_’s `mode`."
+        );
+    }
+
+    #[test]
+    fn note_in_dl_value_gets_own_spec_note_line() {
+        // Notes embedded in a definition value (e.g. the origin property in
+        // step 12 of the Request constructor) move to their own line with a
+        // "Spec note: " prefix instead of running into the value text.
+        let html = r##"
+            <html><body>
+            <p>To make a request:</p>
+            <ol>
+                <li><p>Set <var>request</var> to a new request with the following properties:</p>
+                    <dl>
+                        <dt><a href="#origin">origin</a>
+                        <dd><var>request</var>’s <a href="#origin">origin</a>.
+                            <span class="note">The propagation of the origin is only significant
+                            for navigation requests.</span>
+                    </dl>
+                </li>
+            </ol>
+            </body></html>
+        "##;
+
+        let algos = extract_algorithms(html);
+        assert_eq!(algos.len(), 1);
+        let steps = &algos[0].steps;
+        assert_eq!(steps.len(), 1);
+        assert_eq!(
+            steps[0].text,
+            "Set _request_ to a new request with the following properties:\n- `origin`: _request_’s `origin`.\nSpec note: The propagation of the origin is only significant for navigation requests."
+        );
+    }
+
+    #[test]
+    fn note_paragraph_in_step_gets_own_spec_note_line() {
+        let html = r##"
+            <html><body>
+            <p>To make a request:</p>
+            <ol>
+                <li><p>If <var>init</var> is not empty, then:</p>
+                    <p class="note">This is done to ensure that redirected requests no longer
+                    appear to come from the original source.</p>
+                </li>
+            </ol>
+            </body></html>
+        "##;
+
+        let algos = extract_algorithms(html);
+        assert_eq!(algos.len(), 1);
+        let steps = &algos[0].steps;
+        assert_eq!(steps.len(), 1);
+        assert_eq!(
+            steps[0].text,
+            "If _init_ is not empty, then:\nSpec note: This is done to ensure that redirected requests no longer appear to come from the original source."
         );
     }
 }
