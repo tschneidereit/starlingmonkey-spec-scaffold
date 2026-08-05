@@ -374,12 +374,12 @@ fn extract_div_algorithm_heading(div: &ElementRef, formatted: bool) -> String {
             }
             // Recurse into inline elements (dfn, code, etc.) to get their text
             if formatted {
-                heading.push_str(&format_element(&child_el));
+                push_merging_backticks(&mut heading, &format_element(&child_el));
             } else {
                 heading.push_str(&child_el.text().collect::<String>());
             }
         } else if let Node::Text(t) = child.value() {
-            heading.push_str(t);
+            push_merging_backticks(&mut heading, t);
         }
     }
     heading
@@ -475,10 +475,10 @@ fn collect_step_body(body: &ElementRef, label: &str, out: &mut Vec<Step>) {
                         }
                     }
                 }
-                _ => inline.push_str(&format_element(&el)),
+                _ => push_merging_backticks(&mut inline, &format_element(&el)),
             }
         } else if let Node::Text(t) = child.value() {
-            inline.push_str(t);
+            push_merging_backticks(&mut inline, t);
         }
     }
     flush_inline(&mut inline, &mut lines);
@@ -533,10 +533,7 @@ fn collect_switch_steps(dl: &ElementRef, parent_label: &str, out: &mut Vec<Step>
     for child in dl.children().filter_map(ElementRef::wrap) {
         match child.value().name() {
             "dt" => {
-                // Spec markup nests <code><a>…</a></code>, which would yield
-                // doubled backticks (``Blob``) — collapse them to one pair.
-                let text =
-                    normalize_whitespace(&extract_formatted_text(&child)).replace("``", "`");
+                let text = normalize_whitespace(&extract_formatted_text(&child));
                 if !text.is_empty() {
                     conditions.push(text);
                 }
@@ -1133,12 +1130,26 @@ fn extract_formatted_text(element: &ElementRef) -> String {
     let mut result = String::new();
     for child in element.children() {
         if let Some(child_el) = ElementRef::wrap(child) {
-            result.push_str(&format_element(&child_el));
+            push_merging_backticks(&mut result, &format_element(&child_el));
         } else if let Node::Text(t) = child.value() {
-            result.push_str(t);
+            push_merging_backticks(&mut result, t);
         }
     }
     result
+}
+
+/// Append `piece` to `result`, merging a backtick boundary between them.
+///
+/// Specs write byte sequences with literal backticks around a `<code>`
+/// element (`` `<code>GET</code>` ``); together with the backticks
+/// [`format_element`] adds for the `<code>` itself that would double up, so
+/// adjacent backticks across a concatenation boundary collapse into one.
+fn push_merging_backticks(result: &mut String, piece: &str) {
+    let piece = match piece.strip_prefix('`') {
+        Some(rest) if result.ends_with('`') => rest,
+        _ => piece,
+    };
+    result.push_str(piece);
 }
 
 /// Format a single element, applying the annotation for its own tag around its
@@ -1153,11 +1164,26 @@ fn format_element(element: &ElementRef) -> String {
         return format!("{NOTE_BREAK}Spec note: {inner}{NOTE_BREAK}");
     }
     match element.value().name() {
-        "a" | "code" => format!("`{inner}`"),
+        // Spec markup nests <code><a>…</a></code> (and the reverse); wrapping
+        // both layers would double the backticks, so content that is already
+        // exactly one backtick-quoted span passes through unchanged. Empty
+        // elements (e.g. self-link anchors) get no backticks at all, and
+        // interior backticks (dfn names embedding a code span) are dropped
+        // rather than colliding with the wrapping pair.
+        "a" | "code" if inner.trim().is_empty() || is_single_backtick_span(&inner) => inner,
+        "a" | "code" => format!("`{}`", inner.replace('`', "")),
         "em" | "i" | "var" => format!("_{inner}_"),
         "strong" | "b" => format!("*{inner}*"),
         _ => inner,
     }
+}
+
+/// Whether `text` (modulo surrounding whitespace) is a single backtick-quoted
+/// span, e.g. `` `TypeError` `` — i.e. already fully quoted, with no interior
+/// backticks.
+fn is_single_backtick_span(text: &str) -> bool {
+    let t = text.trim();
+    t.len() >= 2 && t.starts_with('`') && t.ends_with('`') && !t[1..t.len() - 1].contains('`')
 }
 
 /// Sentinel emitted by [`format_element`] around note content to mark line
@@ -3006,6 +3032,86 @@ interface WorkerLocation {
         assert_eq!(algos.len(), 1);
         let labels: Vec<&str> = algos[0].steps.iter().map(|s| s.label.as_str()).collect();
         assert_eq!(labels, ["1", "1 `Blob`"]);
+    }
+
+    #[test]
+    fn nested_code_and_link_yield_single_backticks() {
+        let html = r##"
+            <html><body>
+            <p>The clone() method steps are:</p>
+            <ol>
+                <li>If this is unusable, then throw a <code><a href="#te">TypeError</a></code>.</li>
+                <li>Return a <a href="#resp"><code>Response</code></a> object.</li>
+            </ol>
+            </body></html>
+        "##;
+
+        let algos = extract_algorithms(html);
+        assert_eq!(algos.len(), 1);
+        assert_eq!(
+            algos[0].steps[0].text,
+            "If this is unusable, then throw a `TypeError`."
+        );
+        assert_eq!(algos[0].steps[1].text, "Return a `Response` object.");
+    }
+
+    #[test]
+    fn empty_self_link_anchor_yields_no_backticks() {
+        let html = r##"
+            <html><body>
+            <p>The clone() method steps are:</p>
+            <ol>
+                <li><a class="self-link" href="#step"></a>Set this’s signal.</li>
+            </ol>
+            </body></html>
+        "##;
+
+        let algos = extract_algorithms(html);
+        assert_eq!(algos.len(), 1);
+        assert_eq!(algos[0].steps[0].text, "Set this’s signal.");
+    }
+
+    #[test]
+    fn literal_backticks_around_code_merge_into_one_pair() {
+        // Specs write byte sequences as `<code>GET</code>` — with literal
+        // backtick characters in the surrounding text.
+        let html = r##"
+            <html><body>
+            <p>The clone() method steps are:</p>
+            <ol>
+                <li>If method is neither `<code>GET</code>` nor `<code>HEAD</code>`, then throw.</li>
+            </ol>
+            </body></html>
+        "##;
+
+        let algos = extract_algorithms(html);
+        assert_eq!(algos.len(), 1);
+        assert_eq!(
+            algos[0].steps[0].text,
+            "If method is neither `GET` nor `HEAD`, then throw."
+        );
+    }
+
+    #[test]
+    fn link_text_containing_code_span_keeps_one_backtick_pair() {
+        // Some dfn names embed a code span, e.g. the "`multipart/form-data`
+        // encoding algorithm"; the inner backticks would collide with the
+        // wrapping pair and are dropped.
+        let html = r##"
+            <html><body>
+            <p>The clone() method steps are:</p>
+            <ol>
+                <li>Run the <a href="#mfd">`<code>multipart/form-data</code>` encoding algorithm</a>.</li>
+            </ol>
+            </body></html>
+        "##;
+
+        let algos = extract_algorithms(html);
+        assert_eq!(algos.len(), 1);
+        assert_eq!(
+            algos[0].steps[0].text,
+            "Run the `multipart/form-data encoding algorithm`."
+        );
     }
 
     #[test]
